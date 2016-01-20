@@ -39,7 +39,6 @@
 #include <linux/gpio.h>
 #include <linux/fb.h>
 #include <linux/omapfb.h>
-#include <sound/pcm.h>
 
 #include "dss.h"
 #include "dss_features.h"
@@ -65,34 +64,9 @@ static bool pm_qos_handle_added;
 #define EDID_SIZE_BLOCK0_TIMING_DESCRIPTOR	4
 #define EDID_SIZE_BLOCK1_TIMING_DESCRIPTOR	4
 
-/* HDMI EDID Extension Data Block Tags  */
-#define HDMI_EDID_EX_DATABLOCK_TAG_MASK		0xE0
-#define HDMI_EDID_EX_DATABLOCK_LEN_MASK		0x1F
-/* HDMI EDID Audio */
-#define HDMI_EDID_AUDIO_FORMAT_MASK		0x78
-#define HDMI_EDID_AUDIO_24BIT_MASK		(0x1 << 2)
-#define HDMI_EDID_AUDIO_16BIT_MASK		0x1
-#define HDMI_EDID_AUDIO_FORMAT_SHIFT		3
-#define HDMI_EDID_AUDIO_CHANNELS_MASK		0x07
-#define HDMI_EDID_AUDIO_RATES_MASK		0x7F
-#define HDMI_EDID_AUDIO_32000			1
-#define HDMI_EDID_AUDIO_44100			(1 << 1)
-#define HDMI_EDID_AUDIO_48000			(1 << 2)
-#define HDMI_EDID_AUDIO_88200			(1 << 3)
-#define HDMI_EDID_AUDIO_96000			(1 << 4)
-#define HDMI_EDID_AUDIO_176400			(1 << 5)
-#define HDMI_EDID_AUDIO_192000			(1 << 6)
-
 #define OMAP_HDMI_TIMINGS_NB			34
 #define HDMI_DEFAULT_REGN 15
 #define HDMI_DEFAULT_REGM2 1
-
-enum extension_edid_db {
-	DATABLOCK_AUDIO = 1,
-	DATABLOCK_VIDEO = 2,
-	DATABLOCK_VENDOR = 3,
-	DATABLOCK_SPEAKERS = 4,
-};
 
 static struct {
 	struct mutex lock;
@@ -109,7 +83,10 @@ static struct {
 	bool custom_set;
 	enum hdmi_deep_color_mode deep_color;
 	struct hdmi_config cfg;
+// stargo - regulator handled in board-mapphone-panel
+#if 0
 	struct regulator *hdmi_reg;
+#endif
 
 	int hdmi_irq;
 	struct clk *sys_clk;
@@ -123,6 +100,7 @@ static struct {
 	u8 s3d_mode;
 	bool s3d_enable;
 	int source_physical_address;
+	struct fb_videomode initial_vmode;
 	void (*hdmi_start_frame_cb)(void);
 	void (*hdmi_irq_cb)(int);
 	bool (*hdmi_power_on_cb)(void);
@@ -216,6 +194,18 @@ static int relaxed_fb_mode_is_equal(const struct fb_videomode *mode1,
 static int hdmi_set_timings(struct fb_videomode *vm, bool check_only)
 {
 	int i = 0;
+//STARGO - lapdock support
+	static const struct fb_videomode lapdock_modes[] = {
+		/* 1366x768 @ 60Hz */
+		{.refresh = 60, .xres = 1366, .yres = 768, .pixclock = 13888,
+		 .left_margin = 64, .right_margin = 14,
+		 .upper_margin = 28, .lower_margin = 1,
+		 .hsync_len = 56, .vsync_len = 3,
+		 .sync = FB_SYNC_HOR_HIGH_ACT | FB_SYNC_VERT_HIGH_ACT,
+		 .flag = FB_FLAG_RATIO_16_9,
+		 .vmode = FB_VMODE_NONINTERLACED},
+	};
+//STARGO - end
 	DSSDBG("hdmi_get_code\n");
 
 	if (!vm->xres || !vm->yres || !vm->pixclock)
@@ -223,7 +213,9 @@ static int hdmi_set_timings(struct fb_videomode *vm, bool check_only)
 
 	for (i = 0; i < CEA_MODEDB_SIZE; i++) {
 		if (relaxed_fb_mode_is_equal(cea_modes + i, vm)) {
+			u32 flag = vm->flag;
 			*vm = cea_modes[i];
+			vm->flag = flag;
 			if (check_only)
 				return 1;
 			hdmi.cfg.cm.code = i;
@@ -235,7 +227,9 @@ static int hdmi_set_timings(struct fb_videomode *vm, bool check_only)
 
 	for (i = 0; i < VESA_MODEDB_SIZE; i++) {
 		if (relaxed_fb_mode_is_equal(vesa_modes + i, vm)) {
+			u32 flag = vm->flag;
 			*vm = vesa_modes[i];
+			vm->flag = flag;
 			if (check_only)
 				return 1;
 			hdmi.cfg.cm.code = i;
@@ -244,6 +238,22 @@ static int hdmi_set_timings(struct fb_videomode *vm, bool check_only)
 			goto done;
 		}
 	}
+
+//STARGO - lapdock support
+	for (i = 0; i < sizeof(lapdock_modes) / sizeof(lapdock_modes[0]); i++) {
+		if (relaxed_fb_mode_is_equal(lapdock_modes + i, vm)) {
+			u32 flag = vm->flag;
+			*vm = lapdock_modes[i];
+			vm->flag = flag;
+			if (check_only)
+				return 1;
+			hdmi.cfg.cm.code = i;
+			hdmi.cfg.cm.mode = HDMI_DVI;
+			hdmi.cfg.timings = lapdock_modes[hdmi.cfg.cm.code];
+			goto done;
+		}
+	}
+//STARGO - end
 
 fail:
 	if (check_only)
@@ -263,6 +273,9 @@ void hdmi_get_monspecs(struct fb_monspecs *specs)
 {
 	int i, j;
 	char *edid = (char *) hdmi.edid;
+	int preferred_vmode = -1;
+	int default_code;
+	struct fb_videomode default_vmode;
 
 	memset(specs, 0x0, sizeof(*specs));
 	if (!hdmi.edid_set)
@@ -273,16 +286,32 @@ void hdmi_get_monspecs(struct fb_monspecs *specs)
 		return;
 
 	for (i = 1; i <= edid[0x7e] && i * 128 < HDMI_EDID_MAX_LENGTH; i++) {
-		/* If the CEA Block Tag Extension found */
 		if (edid[i * 128] == 0x2)
 			fb_edid_add_monspecs(edid + i * 128, specs);
 	}
 
 	hdmi.can_do_hdmi = specs->misc & FB_MISC_HDMI;
 
-	/* filter out resolutions we don't support */
+	memset(&hdmi.initial_vmode, 0, sizeof(hdmi.initial_vmode));
+	default_code = hdmi.dssdev->panel.hdmi_default_cea_code;
+	if (default_code > 0 && default_code < CEA_MODEDB_SIZE) {
+		default_vmode = cea_modes[default_code];
+		DSSINFO("Preferred cea_mode[%d], %dx%d@%d\n",
+			default_code, default_vmode.xres,
+			default_vmode.yres, default_vmode.refresh);
+	} else
+		default_code = 0;
+
+	/* mark resolutions we support */
 	for (i = j = 0; i < specs->modedb_len; i++) {
-		u32 max_pclk = hdmi.dssdev->clocks.hdmi.max_pixclk_khz;
+		u32 max_pclk;
+
+		pr_debug("Checking modedb[%d]: %dx%d@%d\n",
+			 i, specs->modedb[i].xres,
+			 specs->modedb[i].yres,
+			 specs->modedb[i].refresh);
+
+		max_pclk = hdmi.dssdev->clocks.hdmi.max_pixclk_khz;
 		if (!hdmi_set_timings(&specs->modedb[i], true))
 			continue;
 
@@ -293,9 +322,107 @@ void hdmi_get_monspecs(struct fb_monspecs *specs)
 		if (specs->modedb[i].flag & FB_FLAG_PIXEL_REPEAT)
 			continue;
 
+		/* if we made it here the mode is actually possible */
+		specs->modedb[i].flag |= FB_FLAG_HW_CAPABLE;
+
+		/* pick out the first mode that it claims to be preferred
+		 * and mark as such */
+		if ((preferred_vmode < 0) &&
+			specs->misc & FB_MISC_1ST_DETAIL &&
+			specs->modedb[i].flag & FB_MODE_IS_DETAILED) {
+			pr_info("First DTD marked preferred video mode: "
+				" %dx%d@%d\n",
+				specs->modedb[i].xres,
+				specs->modedb[i].yres,
+				specs->modedb[i].refresh);
+			specs->modedb[i].flag |= FB_FLAG_PREFERRED;
+			preferred_vmode = i;
+		}
+
+		/*
+		 * If this is a native resolution (came from a SVD),
+		 * and it's higher resolution than the preferred
+		 * resolution from the first DTD, mark it preferred
+		 * instead.
+		 */
+		if ((specs->modedb[i].flag & FB_FLAG_NATIVE) &&
+		    ((preferred_vmode < 0) ||
+		     ((specs->modedb[i].xres * specs->modedb[i].yres) >
+		      (specs->modedb[preferred_vmode].xres *
+		       specs->modedb[preferred_vmode].yres)))) {
+			if (preferred_vmode >= 0) {
+				/* clear previous */
+				specs->modedb[preferred_vmode].flag &=
+					~FB_FLAG_PREFERRED;
+				pr_info("Replacing previous preferred "
+					"vmode with better one\n");
+			}
+			pr_info("Marking native video mode as preferred:"
+				" %dx%d@%d\n",
+				specs->modedb[i].xres,
+				specs->modedb[i].yres,
+				specs->modedb[i].refresh);
+			specs->modedb[i].flag |= FB_FLAG_PREFERRED;
+			preferred_vmode = i;
+		}
+
 		specs->modedb[j++] = specs->modedb[i];
 	}
 	specs->modedb_len = j;
+
+	/*
+	 * Because the preferred mode might change a few times
+	 * in above pass (e.g. if the SVD native is better
+	 * than a DTD first entry), we select the initial
+	 * vmode in a second pass through the list.
+	 */
+	if (default_code) {
+		for (i = 0; i < specs->modedb_len; i++) {
+			/* check if we can use this mode as the initial one */
+			if ((specs->modedb[i].flag & FB_FLAG_HW_CAPABLE) &&
+			    relaxed_fb_mode_is_equal(&default_vmode,
+						     &specs->modedb[i])) {
+				pr_info("initial_vmode set to cea_mode[%d]\n",
+					default_code);
+				hdmi.initial_vmode = specs->modedb[i];
+				break;
+			}
+		}
+	}
+
+	/*
+	 * If the platform preferred mode isn't set or isn't supported
+	 * by the sink, choose the sink's preferred mode if there
+	 * is one.  If there's no sink preferred mode either, then
+	 * choose the first supported mode.
+	 */
+	if (!hdmi.initial_vmode.pixclock) {
+		if (preferred_vmode >= 0) {
+			hdmi.initial_vmode = specs->modedb[preferred_vmode];
+			pr_info("initial_vmode set to sink"
+				" preferred %dx%d@%d\n",
+				hdmi.initial_vmode.xres,
+				hdmi.initial_vmode.yres,
+				hdmi.initial_vmode.refresh);
+		} else {
+			/* take the first supported vmode as the initial one */
+			for (i = 0; i < specs->modedb_len; i++) {
+				if (specs->modedb[i].flag & FB_FLAG_HW_CAPABLE) {
+					pr_info("initial_vmode set to cea_mode[%d]\n",
+						default_code);
+					hdmi.initial_vmode = specs->modedb[i];
+					break;
+				}
+			}
+		}
+	}
+
+	if (hdmi.initial_vmode.pixclock)
+		pr_info("%s: initial_vmode set to %dx%d@%dHz\n",
+			__func__, hdmi.initial_vmode.xres,
+			hdmi.initial_vmode.yres, hdmi.initial_vmode.refresh);
+	else
+		pr_info("%s: No usable video mode found!\n", __func__);
 
 	/* Find out the Source Physical address for the CEC
 	CEC physical address will be part of VSD block from
@@ -343,13 +470,6 @@ u8 *hdmi_read_edid(struct omap_video_timings *dp)
 	ret = read_ti_4xxx_edid(&hdmi.hdmi_data, hdmi.edid,
 						HDMI_EDID_MAX_LENGTH);
 
-	if (ret || memcmp(hdmi.edid, edid_header, sizeof(edid_header))) {
-		DSSERR("failed to read E-EDID\n");
-		memset(hdmi.edid, 0, HDMI_EDID_MAX_LENGTH);
-		hdmi.edid_set = false;
-		return NULL;
-	}
-
 	for (i = 0; i < HDMI_EDID_MAX_LENGTH; i += 16)
 		pr_info("edid[%03x] = %02x %02x %02x %02x %02x %02x %02x %02x "
 			 "%02x %02x %02x %02x %02x %02x %02x %02x\n", i,
@@ -360,13 +480,15 @@ u8 *hdmi_read_edid(struct omap_video_timings *dp)
 			hdmi.edid[i + 12], hdmi.edid[i + 13], hdmi.edid[i + 14],
 			hdmi.edid[i + 15]);
 
-	hdmi.edid_set = true;
-	/*  Callback HDCP only when EDID is read */
-	if (hdmi.hdmi_start_frame_cb &&
-		hdmi.edid_set &&
-		hdmi.wp_reset_done)
-		(*hdmi.hdmi_start_frame_cb)();
+	if (ret) {
+		DSSWARN("failed to read E-EDID\n");
+		return NULL;
+	}
 
+	if (memcmp(hdmi.edid, edid_header, sizeof(edid_header)))
+		return NULL;
+
+	hdmi.edid_set = true;
 	return hdmi.edid;
 }
 
@@ -572,6 +694,9 @@ static int hdmi_power_on(struct omap_dss_device *dssdev)
 	 */
 	dss_select_dispc_clk_source(dssdev->clocks.dispc.dispc_fclk_src);
 
+	/* bypass TV gamma table */
+	dispc_enable_gamma_table(0);
+
 	/* tv size */
 	dispc_set_digit_size(dssdev->panel.timings.x_res,
 			dssdev->panel.timings.y_res);
@@ -580,8 +705,9 @@ static int hdmi_power_on(struct omap_dss_device *dssdev)
 
 	hdmi_ti_4xxx_wp_video_start(&hdmi.hdmi_data, 1);
 
-	if (hdmi.hdmi_start_frame_cb && hdmi.custom_set &&
-	    hdmi.wp_reset_done && hdmi.edid_set)
+	if (hdmi.hdmi_start_frame_cb &&
+	    hdmi.custom_set &&
+	    hdmi.wp_reset_done)
 		(*hdmi.hdmi_start_frame_cb)();
 
 	return 0;
@@ -593,156 +719,22 @@ err:
 
 static void hdmi_power_off(struct omap_dss_device *dssdev)
 {
-	int status;
 	enum hdmi_pwrchg_reasons reason = HDMI_PWRCHG_DEFAULT;
-	status = HDMI_HPD_LOW;
-
-	if (dssdev->sync_lost_error)
-		status |= HDMI_SYNC_LOST;
 	if (hdmi.hdmi_irq_cb)
-		hdmi.hdmi_irq_cb(status);
+		hdmi.hdmi_irq_cb(HDMI_HPD_LOW);
 
 	hdmi_ti_4xxx_wp_video_start(&hdmi.hdmi_data, 0);
-	if (hdmi_get_current_hpd())
-		hdmi_ti_4xxx_wp_audio_enable(&hdmi.hdmi_data, 0);
 
 	dispc_enable_channel(OMAP_DSS_CHANNEL_DIGIT, dssdev->type, 0);
 	if (hdmi.set_mode)
 		reason = reason | HDMI_PWRCHG_MODE_CHANGE;
 	if (dssdev->sync_lost_error)
 		reason = reason | HDMI_PWRCHG_RESYNC;
-	if (dispc_is_channel_enabled(OMAP_DSS_CHANNEL_LCD))
-		dss_select_dispc_clk_source(
-					OMAP_DSS_CLK_SRC_DSI_PLL_HSDIV_DISPC);
 	hdmi_ti_4xxx_phy_off(&hdmi.hdmi_data, reason);
 	hdmi_ti_4xxx_set_pll_pwr(&hdmi.hdmi_data, HDMI_PLLPWRCMD_ALLOFF);
 	hdmi_set_l3_cstr(dssdev, false);
 	hdmi_runtime_put();
 	hdmi.deep_color = HDMI_DEEP_COLOR_24BIT;
-}
-
-static int hdmi_get_datablock_offset(u8 *edid, enum extension_edid_db datablock,
-					unsigned int *offset)
-{
-	u8 current_byte, disp;
-	unsigned int i = 0, length = 0;
-
-	if (edid[0x7e] == 0x00)
-		return 1;
-
-	disp = edid[EDID_DESCRIPTOR_BLOCK1_ADDRESS + 2];
-	DSSDBG("Extension block present db %d %x\n", datablock, disp);
-	if (disp == 0x4)
-		return 1;
-
-	i = EDID_DESCRIPTOR_BLOCK1_ADDRESS + 0x4;
-
-	while (i < (EDID_DESCRIPTOR_BLOCK1_ADDRESS + disp)) {
-		current_byte = edid[i];
-		DSSDBG("i = %x, cur_byte = %x,"
-			"(cur_byte & EX_DATABLOCK_TAG_MASK) = %d\n",
-			i, current_byte,
-			(current_byte & HDMI_EDID_EX_DATABLOCK_TAG_MASK));
-		if ((current_byte >> 5) == datablock) {
-			*offset = i;
-			DSSDBG("datablock %d, offset = %d\n",
-							datablock, *offset);
-			return 0;
-		} else {
-			length = (current_byte &
-					HDMI_EDID_EX_DATABLOCK_LEN_MASK) + 1;
-			i += length;
-		}
-	}
-	return 1;
-}
-
-void omapdss_hdmi_get_audio_descriptors(struct hdmi_audio_edid *audio_db)
-{
-	unsigned int offset;
-	int j = 0, length = 0;
-	enum extension_edid_db vsdb =  DATABLOCK_AUDIO;
-	struct hdmi_audio_descriptor *sad = audio_db->sad;
-	unsigned int rates;
-	char edid[HDMI_EDID_MAX_LENGTH];
-
-	audio_db->length = 0;
-	memset(sad, 0, sizeof(sad));
-
-	if (!hdmi.enabled)
-		return;
-
-	memcpy(edid, hdmi.edid, HDMI_EDID_MAX_LENGTH);
-
-	if (!hdmi_get_datablock_offset(edid, vsdb, &offset)) {
-		length = (edid[offset] & HDMI_EDID_EX_DATABLOCK_LEN_MASK)/3;
-
-		if (length >= HDMI_EDID_SAD_MAX_LENGTH)
-			audio_db->length = HDMI_EDID_SAD_MAX_LENGTH;
-		else
-			audio_db->length = length;
-		offset++;
-		for (j = 0; j < length ; j++) {
-			sad[j].format = (edid[offset + j * 3] &
-				HDMI_EDID_AUDIO_FORMAT_MASK)
-				>> HDMI_EDID_AUDIO_FORMAT_SHIFT;
-			sad[j].num_of_ch = (edid[offset + j * 3] &
-				HDMI_EDID_AUDIO_CHANNELS_MASK) + 1;
-			rates = (edid[offset + j * 3 + 1] &
-				HDMI_EDID_AUDIO_RATES_MASK);
-
-			if (sad[j].format == HDMI_EDID_AUDIO_LPCM) {
-				if (edid[offset + j * 3 + 2] &
-					HDMI_EDID_AUDIO_16BIT_MASK)
-					sad[j].bit_depth |=
-						SNDRV_PCM_FORMAT_S16_LE;
-				if (edid[offset + j * 3 + 2] &
-					HDMI_EDID_AUDIO_24BIT_MASK)
-					sad[j].bit_depth |=
-						SNDRV_PCM_FORMAT_S24_LE;
-			}
-
-			DSSDBG("SAD[%d]: format: %s, nchannels: %d\n", j,
-			    (audio_db->sad[j].format ==
-			    HDMI_EDID_AUDIO_LPCM ? "LPCM" : "Not supported"),
-			    audio_db->sad[j].num_of_ch);
-
-			if (rates & HDMI_EDID_AUDIO_32000) {
-				sad[j].rates |= SNDRV_PCM_RATE_32000;
-				DSSDBG("Rate: SNDRV_PCM_RATE_32000\n");
-			}
-
-			if (rates & HDMI_EDID_AUDIO_44100) {
-				sad[j].rates |= SNDRV_PCM_RATE_44100;
-				DSSDBG("Rate: SNDRV_PCM_RATE_44100\n");
-			}
-
-			if (rates & HDMI_EDID_AUDIO_48000) {
-				sad[j].rates |= SNDRV_PCM_RATE_48000;
-				DSSDBG("Rate: SNDRV_PCM_RATE_48000\n");
-			}
-
-			if (rates & HDMI_EDID_AUDIO_88200) {
-				sad[j].rates |= SNDRV_PCM_RATE_88200;
-				DSSDBG("Rate: SNDRV_PCM_RATE_88200\n");
-			}
-
-			if (rates & HDMI_EDID_AUDIO_96000) {
-				sad[j].rates |= SNDRV_PCM_RATE_96000;
-				DSSDBG("Rate: SNDRV_PCM_RATE_96000\n");
-			}
-
-			if (rates & HDMI_EDID_AUDIO_176400) {
-				sad[j].rates |= SNDRV_PCM_RATE_176400;
-				DSSDBG("Rate: SNDRV_PCM_RATE_176400\n");
-			}
-
-			if (rates & HDMI_EDID_AUDIO_192000) {
-				sad[j].rates |= SNDRV_PCM_RATE_192000;
-				DSSDBG("Rate: SNDRV_PCM_RATE_192000\n");
-			}
-		}
-	}
 }
 
 int omapdss_hdmi_get_pixel_clock(void)
@@ -891,6 +883,23 @@ int omapdss_hdmi_display_set_mode(struct omap_dss_device *dssdev,
 	return r1 ? : r2;
 }
 
+int omapdss_hdmi_display_set_initial_mode(struct omap_dss_device *dssdev)
+{
+	int r1, r2;
+
+	DSSINFO("Enter omapdss_hdmi_display_set_initial_mode\n");
+	if (!hdmi.initial_vmode.pixclock) {
+		DSSWARN("No valid initial_vmode set\n");
+		return -EINVAL;
+	}
+	r1 = hdmi_set_timings(&hdmi.initial_vmode, false) ? 0 : -EINVAL;
+	hdmi.custom_set = 1;
+	hdmi.code = hdmi.cfg.cm.code;
+	hdmi.mode = hdmi.cfg.cm.mode;
+	r2 = dssdev->driver->enable(dssdev);
+	return r1 ? : r2;
+}
+
 void omapdss_hdmi_display_set_timing(struct omap_dss_device *dssdev)
 {
 	struct fb_videomode t;
@@ -930,6 +939,8 @@ int omapdss_hdmi_display_enable(struct omap_dss_device *dssdev)
 		}
 	}
 
+// stargo - regulator handled in board-mapphone-panel
+#if 0
 	hdmi.hdmi_reg = regulator_get(NULL, "hdmi_vref");
 	if (IS_ERR_OR_NULL(hdmi.hdmi_reg)) {
 		DSSERR("Failed to get hdmi_vref regulator\n");
@@ -942,6 +953,7 @@ int omapdss_hdmi_display_enable(struct omap_dss_device *dssdev)
 		DSSERR("failed to enable hdmi_vref regulator\n");
 		goto err3;
 	}
+#endif
 
 	r = hdmi_power_on(dssdev);
 	if (r) {
@@ -955,10 +967,12 @@ int omapdss_hdmi_display_enable(struct omap_dss_device *dssdev)
 	return 0;
 
 err4:
+#if 0
 	regulator_disable(hdmi.hdmi_reg);
 err3:
 	regulator_put(hdmi.hdmi_reg);
 err2:
+#endif
 	if (dssdev->platform_disable)
 		dssdev->platform_disable(dssdev);
 err1:
@@ -983,13 +997,17 @@ void omapdss_hdmi_display_disable(struct omap_dss_device *dssdev)
 	hdmi_power_off(dssdev);
 	if (dssdev->sync_lost_error == 0)
 		if (dssdev->state != OMAP_DSS_DISPLAY_SUSPENDED) {
-			/* clear custom set on disable only.*/
+			/* clear EDID and mode on disable only */
+			hdmi.edid_set = false;
 			hdmi.custom_set = 0;
 			pr_info("hdmi: clearing EDID info\n");
 		}
+// stargo - regulator handled in board-mapphone-panel
+#if 0
 	regulator_disable(hdmi.hdmi_reg);
 
 	regulator_put(hdmi.hdmi_reg);
+#endif
 
 	if (dssdev->platform_disable)
 		dssdev->platform_disable(dssdev);
@@ -1100,7 +1118,15 @@ static int omapdss_hdmihw_probe(struct platform_device *pdev)
 	hdmi.hdmi_data.hdmi_phy_offset = HDMI_PHY;
 	hdmi.wp_reset_done = false;
 
+//lucize - moto hack
+	/* Init the drive strength percent to full power */
+	hdmi.dssdev->phy.hdmi.phy = 100;
+//
 	hdmi_panel_init();
+
+//stargo - enable 5v regulator
+	if (hdmi.dssdev->platform_enable_hpd)
+		r = hdmi.dssdev->platform_enable_hpd(hdmi.dssdev);
 
 	if(hdmi_get_current_hpd())
 		hdmi_panel_hpd_handler(1);
@@ -1110,6 +1136,10 @@ static int omapdss_hdmihw_probe(struct platform_device *pdev)
 
 static int omapdss_hdmihw_remove(struct platform_device *pdev)
 {
+//stargo - disable 5v regulator
+	if (hdmi.dssdev->platform_disable_hpd)
+		hdmi.dssdev->platform_disable_hpd(hdmi.dssdev);
+
 	hdmi_panel_exit();
 
 	if (hdmi.dssdev)
