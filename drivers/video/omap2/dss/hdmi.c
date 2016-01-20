@@ -1049,91 +1049,6 @@ static void hdmi_put_clocks(void)
 		clk_put(hdmi.hdmi_clk);
 }
 
-/* HDMI HW IP initialisation */
-static int omapdss_hdmihw_probe(struct platform_device *pdev)
-{
-	struct resource *hdmi_mem;
-	struct omap_dss_board_info *board_data;
-	int r;
-
-	hdmi.pdata = pdev->dev.platform_data;
-	hdmi.pdev = pdev;
-
-	mutex_init(&hdmi.lock);
-
-	/* save reference to HDMI device */
-	board_data = hdmi.pdata->board_data;
-	for (r = 0; r < board_data->num_devices; r++) {
-		if (board_data->devices[r]->type == OMAP_DISPLAY_TYPE_HDMI)
-			hdmi.dssdev = board_data->devices[r];
-	}
-	if (!hdmi.dssdev) {
-		DSSERR("can't get HDMI device\n");
-		return -EINVAL;
-	}
-
-	hdmi_mem = platform_get_resource(hdmi.pdev, IORESOURCE_MEM, 0);
-	if (!hdmi_mem) {
-		DSSERR("can't get IORESOURCE_MEM HDMI\n");
-		return -EINVAL;
-	}
-
-	/* Base address taken from platform */
-	hdmi.hdmi_data.base_wp = ioremap(hdmi_mem->start,
-						resource_size(hdmi_mem));
-	if (!hdmi.hdmi_data.base_wp) {
-		DSSERR("can't ioremap WP\n");
-		return -ENOMEM;
-	}
-
-	r = hdmi_get_clocks(pdev);
-	if (r) {
-		iounmap(hdmi.hdmi_data.base_wp);
-		return r;
-	}
-
-	pm_runtime_enable(&pdev->dev);
-
-	r = request_irq(gpio_to_irq(hdmi.dssdev->hpd_gpio), hpd_irq_handler,
-			IRQF_DISABLED | IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
-			"hpd", NULL);
-	if (r < 0) {
-		pr_err("hdmi: request_irq %d failed\n",
-			gpio_to_irq(hdmi.dssdev->hpd_gpio));
-		return -EINVAL;
-	}
-
-	hdmi.hdmi_irq = platform_get_irq(pdev, 0);
-
-	r = request_irq(hdmi.hdmi_irq, hdmi_irq_handler, 0, "OMAP HDMI", NULL);
-	if (r < 0) {
-		pr_err("hdmi: request_irq %s failed\n",
-			pdev->name);
-		return -EINVAL;
-	}
-
-	hdmi.hdmi_data.hdmi_core_sys_offset = HDMI_CORE_SYS;
-	hdmi.hdmi_data.hdmi_core_av_offset = HDMI_CORE_AV;
-	hdmi.hdmi_data.hdmi_pll_offset = HDMI_PLLCTRL;
-	hdmi.hdmi_data.hdmi_phy_offset = HDMI_PHY;
-	hdmi.wp_reset_done = false;
-
-//lucize - moto hack
-	/* Init the drive strength percent to full power */
-	hdmi.dssdev->phy.hdmi.phy = 100;
-//
-	hdmi_panel_init();
-
-//stargo - enable 5v regulator
-	if (hdmi.dssdev->platform_enable_hpd)
-		r = hdmi.dssdev->platform_enable_hpd(hdmi.dssdev);
-
-	if(hdmi_get_current_hpd())
-		hdmi_panel_hpd_handler(1);
-
-	return 0;
-}
-
 static int omapdss_hdmihw_remove(struct platform_device *pdev)
 {
 //stargo - disable 5v regulator
@@ -1156,7 +1071,6 @@ static int omapdss_hdmihw_remove(struct platform_device *pdev)
 }
 
 static struct platform_driver omapdss_hdmihw_driver = {
-	.probe          = omapdss_hdmihw_probe,
 	.remove         = omapdss_hdmihw_remove,
 	.driver         = {
 		.name   = "omapdss_hdmi",
