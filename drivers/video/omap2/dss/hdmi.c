@@ -695,7 +695,7 @@ static int hdmi_power_on(struct omap_dss_device *dssdev)
 	dss_select_dispc_clk_source(dssdev->clocks.dispc.dispc_fclk_src);
 
 	/* bypass TV gamma table */
-	/* dispc_enable_gamma_table(0); */
+	dispc_enable_gamma_table(0);
 
 	/* tv size */
 	dispc_set_digit_size(dssdev->panel.timings.x_res,
