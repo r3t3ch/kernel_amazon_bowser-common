@@ -1049,29 +1049,7 @@ static void hdmi_put_clocks(void)
 		clk_put(hdmi.hdmi_clk);
 }
 
-static int omapdss_hdmihw_remove(struct platform_device *pdev)
-{
-//stargo - disable 5v regulator
-	if (hdmi.dssdev->platform_disable_hpd)
-		hdmi.dssdev->platform_disable_hpd(hdmi.dssdev);
-
-	hdmi_panel_exit();
-
-	if (hdmi.dssdev)
-		free_irq(gpio_to_irq(hdmi.dssdev->hpd_gpio), hpd_irq_handler);
-	hdmi.dssdev = NULL;
-
-	pm_runtime_disable(&pdev->dev);
-
-	hdmi_put_clocks();
-
-	iounmap(hdmi.hdmi_data.base_wp);
-
-	return 0;
-}
-
 static struct platform_driver omapdss_hdmihw_driver = {
-	.remove         = omapdss_hdmihw_remove,
 	.driver         = {
 		.name   = "omapdss_hdmi",
 		.owner  = THIS_MODULE,
