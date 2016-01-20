@@ -383,28 +383,6 @@ static ssize_t manager_cpr_coef_store(struct omap_overlay_manager *mgr,
 
 	return size;
 }
-static ssize_t manager_gamma_show(
-		struct omap_overlay_manager *mgr, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d\n", mgr->info.gamma);
-}
-
-static ssize_t manager_gamma_store(
-		struct omap_overlay_manager *mgr,
-		const char *buf, size_t size)
-{
-	int gamma_value;
-
-	if (sscanf(buf, "%d", &gamma_value) != 1)
-		return -EINVAL;
-
-	if (mgr->device)
-		dispc_enable_gamma(mgr->device->channel, gamma_value);
-	else
-		return -EINVAL;
-
-	return size;
-}
 
 struct manager_attribute {
 	struct attribute attr;
@@ -438,9 +416,6 @@ static MANAGER_ATTR(cpr_coef, S_IRUGO|S_IWUSR,
 		manager_cpr_coef_show,
 		manager_cpr_coef_store);
 
-static MANAGER_ATTR(gamma, S_IRUGO|S_IWUSR,
-			manager_gamma_show,
-			manager_gamma_store);
 
 static struct attribute *manager_sysfs_attrs[] = {
 	&manager_attr_name.attr,
@@ -452,7 +427,6 @@ static struct attribute *manager_sysfs_attrs[] = {
 	&manager_attr_alpha_blending_enabled.attr,
 	&manager_attr_cpr_enable.attr,
 	&manager_attr_cpr_coef.attr,
-	&manager_attr_gamma.attr,
 	NULL
 };
 
@@ -596,7 +570,6 @@ struct manager_cache_data {
 
 	enum omap_dss_trans_key_type trans_key_type;
 	u32 trans_key;
-	u8 gamma;
 	bool trans_enabled;
 
 	bool alpha_enabled;
@@ -1659,13 +1632,7 @@ static void schedule_completion_irq(void)
 
 	if (mask != dss_cache.comp_irq_enabled) {
 		if (dss_cache.comp_irq_enabled)
-			/* Code paths leading to here are non-trivial, and
-			 * this particular callback does not seem to be
-			 * needing synchronized unregister. To ease our
-			 * lives, just leave it nosync.
-			 */
-			omap_dispc_unregister_isr_nosync(
-				dss_completion_irq_handler,
+			omap_dispc_unregister_isr(dss_completion_irq_handler,
 				NULL, dss_cache.comp_irq_enabled);
 		if (mask)
 			omap_dispc_register_isr(dss_completion_irq_handler,
@@ -1784,7 +1751,7 @@ static void dss_apply_irq_handler(void *data, u32 mask)
 	if (dss_has_feature(FEAT_MGR_LCD2))
 		irq_mask |= DISPC_IRQ_VSYNC2;
 
-	omap_dispc_unregister_isr_nosync(dss_apply_irq_handler, NULL, irq_mask);
+	omap_dispc_unregister_isr(dss_apply_irq_handler, NULL, irq_mask);
 	dss_cache.irq_enabled = false;
 
 end:
@@ -2165,7 +2132,6 @@ static int omap_dss_mgr_apply(struct omap_overlay_manager *mgr)
 	mc->alpha_enabled = mgr->info.alpha_enabled;
 	mc->cpr_coefs = mgr->info.cpr_coefs;
 	mc->cpr_enable = mgr->info.cpr_enable;
-	mc->gamma = mgr->info.gamma;
 
 	mc->manual_upd_display =
 		dssdev->caps & OMAP_DSS_DISPLAY_CAP_MANUAL_UPDATE;
