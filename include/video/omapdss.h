@@ -463,6 +463,10 @@ struct omap_overlay_manager_info {
 	bool cpr_enable;
 	struct omap_dss_cpr_coefs cpr_coefs;
 	u8 gamma;
+	
+	/* cpr settings provided via the sysfs entry */
+	bool cpr_enable_sys;
+	struct omap_dss_cpr_coefs cpr_coefs_sys;	
 };
 
 struct omap_overlay_manager {
