@@ -21,7 +21,7 @@ CONFIG_CFG80211=y
 # CONFIG_MAC80211 is not set
 CONFIG_RFKILL_INPUT=y
 
-CONFIG_BCMDHD=m
+CONFIG_BCMDHD=y
 CONFIG_BCMDHD_FW_PATH="system/vendor/firmware/fw_bcmdhd.bin"
 CONFIG_BCMDHD_NVRAM_PATH="/system/etc/wifi/bcmdhd.cal"
 
